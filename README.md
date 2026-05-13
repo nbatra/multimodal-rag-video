@@ -55,35 +55,61 @@ The project implements and compares progressively more sophisticated approaches,
 
 ## Architecture
 
+The pipeline evolved iteratively through error analysis: each improvement was motivated by diagnosing failures at the previous stage. The final unified architecture is:
+
 ```
-Question + Answer Options
-         |
-         v
-[Stage 1: Retrieval]
-    BM25 (show-scoped, query-expanded) -> top-50
-    Dense (e5-small-v2 + FAISS) -> top-50
-    Reciprocal Rank Fusion -> top-50 combined
-         |
-         v
-[Stage 2: Reranking]
-    Cross-encoder (ms-marco-MiniLM-L-6-v2)
-    Scores all 50 candidates jointly with query
-    Promotes semantically relevant clips to top-5
-         |
-         v
-[Stage 3: Answer Selection]
-    For dialogue questions:
-        Cross-encoder scores (evidence+question, answer_i) for each option
-    For visual questions (with video available):
-        CLIP (ViT-L/14) computes text-image similarity per frame
-        Adaptive fusion: alpha * text_score + (1-alpha) * visual_score
-         |
-         v
-[Stage 4: Confidence + Quality]
-    Score margin between top-1 and top-2 answer
-    Faithfulness check (token grounding in evidence)
-    Selective prediction: abstain when confidence < threshold
+Input: Question + 5 answer options + show_name + timestamp
+
+                    [Stage 1: HYBRID RETRIEVAL]
+                           |
+         +-----------------+-----------------+
+         |                                   |
+    BM25 (show-scoped,                Dense (e5-small-v2)
+     query-expanded)                   FAISS cosine search
+         |                                   |
+         +--- top-50 ----+---- top-50 -------+
+                         |
+               Reciprocal Rank Fusion (k=60)
+                         |
+                      top-50 fused
+                         |
+                    [Stage 2: CROSS-ENCODER RERANKING]
+                         |
+              ms-marco-MiniLM-L-6-v2 scores
+              each (question, clip) pair jointly
+                         |
+                      top-5 reranked
+                         |
+                    [Stage 3: ANSWER SELECTION]
+                         |
+         +----- Is question visual? -----+
+         |                               |
+         No (dialogue)                   Yes (visual + video available)
+         |                               |
+    Cross-encoder                   CLIP ViT-L/14
+    scores (evidence+Q,             frame extraction (ffmpeg 1fps)
+     answer_i) for i=0..4           text-image similarity per answer
+         |                               |
+         +-------- adaptive fusion ------+
+         |    alpha=0.7 (dialogue)       |
+         |    alpha=0.3 (visual)         |
+         +--- predicted answer ----------+
+                         |
+                    [Stage 4: CONFIDENCE]
+                         |
+              Score margin (top-1 vs top-2)
+              Selective prediction threshold
+                         |
+                      Final answer + confidence
 ```
+
+**Why this architecture (the reasoning chain):**
+1. BM25 baseline achieved R@20=33.7% -- error analysis showed 72.7% of failures were retrieval misses
+2. Dense retrieval alone: +3.3pp. But BM25 and dense make complementary errors (sparse catches rare terms, dense catches semantics)
+3. Hybrid RRF: +11.9pp R@20 -- the single biggest retrieval improvement
+4. Cross-encoder reranking: R@1 nearly doubled (12% to 23.6%) -- expensive precision on the cheap recall set
+5. Cross-encoder answer scoring: +4pp over token overlap -- understands paraphrase and entailment
+6. CLIP visual: +16.6pp on visual questions -- 39.8% of questions are unanswerable from text alone
 
 ## Notebook Series
 
@@ -122,19 +148,45 @@ Question + Answer Options
 
 ## Why Each Strategy Was Tried
 
-The progression follows a clear diagnostic logic:
+The progression follows a clear diagnostic logic -- each improvement was motivated by error analysis of the previous stage:
 
-1. **Start with BM25 baseline** -- establishes what pure lexical matching achieves
-2. **Error analysis reveals 72.7% failures are retrieval** -- retrieval is the bottleneck
-3. **Show-scoping + query expansion** -- cheapest fixes, exploit metadata and MC format
+1. **Start with BM25 baseline** -- establishes what pure lexical matching achieves (R@20=33.7%)
+2. **Error analysis reveals 72.7% failures are retrieval** -- retrieval is the bottleneck, not answer selection
+3. **Show-scoping + query expansion** -- cheapest fixes first, exploit metadata and MC format (+2.3pp)
 4. **Dense retrieval** -- addresses the paraphrase gap (question says "frustrated", subtitle says "done talking to you")
-5. **Hybrid RRF** -- BM25 and dense have complementary strengths; fusing captures both
-6. **Cross-encoder reranking** -- BM25/dense get the right clip into top-50 (45.6%) but not top-1; cross-encoder provides the semantic precision to promote it
-7. **Cross-encoder answer scoring** -- token overlap for answer selection hits a ceiling at ~48% oracle; cross-encoder understands entailment and paraphrase
-8. **Visual pipeline** -- 39.8% of questions are fundamentally unanswerable from text; CLIP provides frame-level evidence for visual reasoning
-9. **Speaker/temporal heuristics** -- tested and rejected; confirms that surface-level structural signals don't add value beyond what BM25 already captures
+5. **Hybrid RRF** -- BM25 and dense have complementary strengths; fusing captures both (+11.9pp)
+6. **Cross-encoder reranking** -- BM25/dense get the right clip into top-50 (45.6%) but not top-1; cross-encoder provides the semantic precision to promote it (R@1 doubled)
+7. **Cross-encoder answer scoring** -- token overlap for answer selection hits a ceiling at ~48% oracle; cross-encoder understands entailment and paraphrase (+4pp)
+8. **Question classification** -- heuristic analysis reveals 39.8% of questions require visual information not in subtitles; text improvements have diminishing returns on these
+9. **CLIP visual pipeline** -- extract frames from video episodes, encode with CLIP ViT-L/14, compute text-image similarity per answer option; adaptive fusion combines visual and text evidence (+16.6pp on visual questions)
+10. **Speaker/temporal heuristics** -- tested and rejected; confirms that surface-level structural signals don't add value beyond what BM25 already captures
 
-Each step either improved accuracy (kept) or was honestly reported as a negative result (NB04 token reranking, NB14 speaker/temporal).
+Each step either improved accuracy (kept) or was honestly reported as a negative result (NB04 token reranking, NB14 speaker/temporal). The architecture doc (ARCHITECTURE.md) contains the full reasoning chain with specific numbers at each stage.
+
+## Visual Model: CLIP ViT-L/14
+
+The visual pipeline uses OpenAI's CLIP ViT-L/14 to score answer options against extracted video frames. Understanding its capabilities and limitations is important for interpreting results.
+
+**What CLIP can detect:**
+- Scene type and setting (indoor/outdoor, office, hospital, apartment)
+- Objects and props (coffee cups, whiteboards, phones, weapons)
+- General actions (standing, sitting, walking, pointing, hugging)
+- Colors and clothing (red shirt, blue dress, lab coat)
+- Spatial relationships (person near door, object on table)
+
+**What CLIP cannot do:**
+- Identify specific characters by face (it does not know who "Sheldon" or "Beckett" is)
+- Detect fine-grained emotions (subtle frustration vs. annoyance vs. disappointment)
+- Reason temporally across frames (it scores each frame independently)
+- Read text in scenes (whiteboard content, phone screens)
+- Understand character relationships or social dynamics from visual cues alone
+
+**How to improve in production:**
+- Add a face recognition module (train on show-specific face crops) for character identification
+- Use video-language models (VideoCLIP, InternVideo, Video-LLaVA) for temporal reasoning
+- Fine-tune CLIP on TV show frames with character-labeled captions
+- Use OCR for text-heavy scenes (whiteboards, computer screens)
+- Ensemble multiple visual models for different question subtypes
 
 ## Technical Stack
 
@@ -143,16 +195,36 @@ Each step either improved accuracy (kept) or was honestly reported as a negative
 | Sparse Retrieval | rank-bm25 | BM25 keyword search |
 | Dense Retrieval | sentence-transformers (e5-small-v2) | Semantic embedding + FAISS |
 | Cross-Encoder | ms-marco-MiniLM-L-6-v2 | Reranking + answer scoring |
-| Visual | OpenCLIP (ViT-L/14) | Frame embedding + text-image similarity |
+| Visual | CLIP ViT-L/14 (HuggingFace transformers) | Frame embedding + text-image similarity |
 | Frame Extraction | ffmpeg | Keyframe extraction at 1 fps |
 | Data Science | pandas, numpy, matplotlib, seaborn | Analysis and visualization |
 
-## Hardware
+## Hardware and Production Considerations
 
+**Development environment (this project):**
 - Apple M4 Max, 64 GB RAM
 - MPS backend for PyTorch inference
 - 644 GB available disk (53 GB used for video episodes)
 - All models run locally -- no API calls required
+
+**Design choices constrained by hardware:**
+
+| Choice Made | Why | Production Alternative |
+|-------------|-----|----------------------|
+| e5-small-v2 (384-dim) | Fast encoding on CPU/MPS, fits in RAM alongside other models | e5-large-v2 or bge-large (1024-dim) on GPU for better recall |
+| MiniLM-L-6-v2 (6 layers) | Fast cross-encoder inference (~1ms/pair) | 12-layer or fine-tuned cross-encoder for higher precision |
+| FAISS IndexFlatIP (exact search) | 21,793 vectors is small enough for brute-force | HNSW or IVF indices for million-scale corpora |
+| CLIP ViT-L/14 | Fits on MPS, well-tested, good zero-shot performance | SigLIP, InternVL, or fine-tuned CLIP for domain-specific tasks |
+| Sequential per-question processing | Simple, debuggable | Batch GPU inference with async frame extraction |
+| 200-question eval subset | Full 15K would take hours on single machine | Distributed evaluation across GPU cluster |
+
+**Production scaling recommendations:**
+- Use GPU clusters (A100/H100) for batch embedding of the full corpus
+- Deploy cross-encoder reranking as a microservice with batched inference
+- Use approximate nearest neighbor search (HNSW, ScaNN) for corpora > 100K documents
+- Consider LLM-based answer scoring (GPT-4, Claude) for the final answer selection stage -- more expensive but substantially more capable at reasoning
+- Pre-extract and cache video frame embeddings rather than computing on-the-fly
+- Add a dedicated face recognition model for character identification in visual questions
 
 ## How to Run
 
