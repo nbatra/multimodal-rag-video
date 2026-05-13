@@ -1,0 +1,24 @@
+# Data (118GB+ TVQA-Long dataset, downloaded via download_tvqa.py)
+data/
+
+# Model artifacts
+models/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+.prompts/
+.old/
